@@ -63,7 +63,7 @@ All variables have defaults; set them in `.env` / `docker-compose` for productio
 | `UPSTREAM_URL` | `https://api.anthropic.com` | Upstream host only. The `/v1/messages` path is added in code — do not append it. |
 | `MODEL_PREFIX` | `cursor-` | Prefix stripped before forwarding (`cursor-claude-opus-4-8` -> `claude-opus-4-8`). |
 | `ANTHROPIC_VERSION` | `2023-06-01` | `anthropic-version` header. |
-| `PORT` | `3000` | Listen port. The container is always 3000; the published port is set in compose. |
+| `PORT` | `3000` | Port the service listens on. |
 | `DEBUG` | `0` | Set to `1` to log request/response summaries. |
 
 ## Notes
