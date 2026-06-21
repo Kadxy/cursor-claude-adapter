@@ -1,0 +1,12 @@
+# build artifacts
+cursor-claude-adapter
+
+# vcs & env
+.git
+.gitignore
+.env
+.env.example
+
+# docs & compose (not needed in image build)
+README.md
+docker-compose.yml

@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// 把 toAnthropic 输出里所有 content block 的 type 收集出来,方便断言。
+// blockTypes collects the type of every content block in toAnthropic's output, for assertions.
 func blockTypes(msgs []map[string]any) []string {
 	var types []string
 	for _, m := range msgs {
@@ -37,8 +37,8 @@ func has(types []string, want string) bool {
 	return false
 }
 
-// 核心回归:Cursor 把 tool_result 当原生 Anthropic block 塞进 user content 数组。
-// 修复前会被丢弃,修复后必须透传到上游。
+// Core regression: Cursor puts tool_result into the user content array as a native Anthropic
+// block. Before the fix it was dropped; after the fix it must pass through to upstream.
 func TestEmbeddedToolResultSurvives(t *testing.T) {
 	body := map[string]any{
 		"model": "cursor-claude-opus-4-8",
@@ -47,7 +47,7 @@ func TestEmbeddedToolResultSurvives(t *testing.T) {
 			map[string]any{"role": "assistant", "content": []any{
 				map[string]any{"type": "tool_use", "id": "toolu_1", "name": "run_terminal_cmd", "input": map[string]any{"command": "curl ifconfig.me"}},
 			}},
-			// Cursor 多轮:tool_result 直接塞进 user content 数组(原生 Anthropic 格式)
+			// Cursor multi-turn: tool_result goes straight into the user content array (native Anthropic format)
 			map[string]any{"role": "user", "content": []any{
 				map[string]any{"type": "tool_result", "tool_use_id": "toolu_1", "content": "1.2.3.4"},
 			}},
@@ -56,14 +56,14 @@ func TestEmbeddedToolResultSurvives(t *testing.T) {
 	msgs := msgsOf(t, body)
 	types := blockTypes(msgs)
 	if !has(types, "assistant:tool_use") {
-		t.Fatalf("assistant tool_use 丢失: %v", types)
+		t.Fatalf("assistant tool_use lost: %v", types)
 	}
 	if !has(types, "user:tool_result") {
-		t.Fatalf("user tool_result 被丢弃(这就是 round-trip 崩的根因): %v", types)
+		t.Fatalf("user tool_result dropped (this is the root cause of broken round-trips): %v", types)
 	}
 }
 
-// role:"tool" 路径(OpenAI 标准格式)也要正确转成 tool_result。
+// The role:"tool" path (standard OpenAI format) must also convert correctly into tool_result.
 func TestRoleToolPath(t *testing.T) {
 	body := map[string]any{
 		"model": "cursor-claude-opus-4-8",
@@ -78,11 +78,11 @@ func TestRoleToolPath(t *testing.T) {
 	msgs := msgsOf(t, body)
 	types := blockTypes(msgs)
 	if !has(types, "assistant:tool_use") || !has(types, "user:tool_result") {
-		t.Fatalf("role:tool 转换失败: %v", types)
+		t.Fatalf("role:tool conversion failed: %v", types)
 	}
 }
 
-// 多个 tool_result 必须合并进同一个 user 消息(Anthropic 要求)。
+// Multiple tool_results must be merged into a single user message (Anthropic requires it).
 func TestMultipleToolResultsMerge(t *testing.T) {
 	body := map[string]any{
 		"model": "cursor-claude-opus-4-8",
@@ -97,10 +97,10 @@ func TestMultipleToolResultsMerge(t *testing.T) {
 		},
 	}
 	msgs := msgsOf(t, body)
-	// 最后一条 user 必须含 2 个 tool_result
+	// the last user message must contain 2 tool_results
 	last := msgs[len(msgs)-1]
 	if last["role"] != "user" {
-		t.Fatalf("末条应为 user, got %v", last["role"])
+		t.Fatalf("last message should be user, got %v", last["role"])
 	}
 	n := 0
 	for _, bv := range last["content"].([]any) {
@@ -109,16 +109,16 @@ func TestMultipleToolResultsMerge(t *testing.T) {
 		}
 	}
 	if n != 2 {
-		t.Fatalf("两个 tool_result 应合并进一个 user 消息, got %d", n)
+		t.Fatalf("the two tool_results should merge into one user message, got %d", n)
 	}
 }
 
-// 模型名 -<effort> 后缀 → 去后缀 + 注入 thinking/effort;无后缀 = 不注入。
+// Model name -<effort> suffix -> strip suffix + inject thinking/effort; no suffix = no injection.
 func TestEffortSuffix(t *testing.T) {
 	cases := []struct {
 		in        string
 		wantModel string
-		wantEff   string // "" = 不应有 thinking/output_config
+		wantEff   string // "" = should have no thinking/output_config
 	}{
 		{"cursor-claude-opus-4-8", "claude-opus-4-8", ""},
 		{"cursor-claude-opus-4-8-xhigh", "claude-opus-4-8", "xhigh"},
@@ -137,20 +137,20 @@ func TestEffortSuffix(t *testing.T) {
 		}
 		if c.wantEff == "" {
 			if _, ok := out["thinking"]; ok {
-				t.Errorf("%s: 不该注入 thinking", c.in)
+				t.Errorf("%s: should not inject thinking", c.in)
 			}
 			if _, ok := out["output_config"]; ok {
-				t.Errorf("%s: 不该注入 output_config", c.in)
+				t.Errorf("%s: should not inject output_config", c.in)
 			}
 			continue
 		}
 		th, _ := out["thinking"].(map[string]any)
 		if th == nil || th["type"] != "adaptive" {
-			t.Errorf("%s: thinking 应为 {type:adaptive}, got %v", c.in, out["thinking"])
+			t.Errorf("%s: thinking should be {type:adaptive}, got %v", c.in, out["thinking"])
 		}
 		oc, _ := out["output_config"].(map[string]any)
 		if oc == nil || oc["effort"] != c.wantEff {
-			t.Errorf("%s: effort 应为 %s, got %v", c.in, c.wantEff, out["output_config"])
+			t.Errorf("%s: effort should be %s, got %v", c.in, c.wantEff, out["output_config"])
 		}
 	}
 }
@@ -160,12 +160,12 @@ func TestFirstMustBeUserAndSkipEmpty(t *testing.T) {
 		"model": "cursor-claude-opus-4-8",
 		"messages": []any{
 			map[string]any{"role": "assistant", "content": "leading assistant"},
-			map[string]any{"role": "user", "content": "   "}, // 纯空白,应跳过
+			map[string]any{"role": "user", "content": "   "}, // pure whitespace, should be skipped
 			map[string]any{"role": "user", "content": "real question"},
 		},
 	}
 	msgs := msgsOf(t, body)
 	if msgs[0]["role"] != "user" {
-		t.Fatalf("首条必须是 user, got %v", msgs[0]["role"])
+		t.Fatalf("first message must be user, got %v", msgs[0]["role"])
 	}
 }

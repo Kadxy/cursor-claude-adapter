@@ -1,80 +1,46 @@
-// cursor-claude-adapter — 让 Cursor BYOK 用上你自己的 Anthropic 格式中转。
+// cursor-claude-adapter lets Cursor BYOK use your own Anthropic-format relay.
 //
-// 数据流:
+// Flow: Cursor (OpenAI Chat Completions) -> this adapter converts to Anthropic
+// Messages -> your upstream relay (/v1/messages) -> the Anthropic response
+// (stream or not) is converted back to OpenAI -> Cursor.
 //
-//	Cursor(OpenAI Chat Completions 格式) --[override OpenAI Base URL]--> 本程序
-//	  --> 转成 Anthropic Messages --> 你的上游中转(/v1/messages)
-//	  --> Anthropic 响应(流式/非流式)转回 OpenAI 格式 --> Cursor
+// Cursor only lets you override the OpenAI Base URL, so the adapter takes OpenAI
+// in and produces Anthropic out. It targets /v1/messages (not chat/completions)
+// to keep Anthropic prompt caching and to build clean tool-call chunks itself,
+// so multi-turn tool_result round-trips don't break.
 //
-// 为什么是这个形态:
-//   - Cursor BYOK 没有 Anthropic Base URL 覆写,唯一能改 URL 的是 Override OpenAI
-//     Base URL,它发的是标准 Chat Completions。所以只能 OpenAI 进、Anthropic 出。
-//   - Cursor 由服务端发请求,本程序必须公网可达 + HTTPS(cloudflared 打洞即可)。
-//   - 走 /v1/messages 而非 /v1/chat/completions:只有 messages 路径保留 Anthropic
-//     prompt cache(省钱),且 tool_call 分片由本程序生成、干净,多轮 tool_result 才不崩。
+// Config is via env vars (all have defaults); see README.md for the full setup,
+// model list, thinking levels, and deployment notes.
 //
-// 核心坑(convertParts):Cursor 多轮工具时,会把 tool_use / tool_result 当原生
-// Anthropic block 直接塞进 message 的 content 数组,必须原样透传,否则工具结果被丢弃。
-//
-// 环境变量(均有默认值,生产配在 .env / docker-compose):
-//
-//	UPSTREAM_URL       上游服务地址(只配 host,默认 http://152.53.52.170:3003);/v1/messages 路径在代码里固定拼接,不要带
-//	MODEL_PREFIX       Cursor 模型名前缀,转发前去掉(默认 cursor-;cursor-claude-opus-4-8 → claude-opus-4-8)
-//	ANTHROPIC_VERSION  anthropic-version 头(默认 2023-06-01)
-//	PORT               监听端口(默认 3000;docker 里容器固定 3000,对外端口看 compose)
-//	DEBUG              =1 打印进出报文摘要
-//
-// /v1/models 暴露给 Cursor 的模型列表是代码里动态展开的(baseModels × 思考档),无需配置;
-// 加新模型只改 main.go 的 baseModels。
-//
-// 思考等级:模型名加后缀 -low/-medium/-high/-xhigh/-max,即注入 thinking:adaptive +
-// output_config.effort 开启对应等级的思考(xhigh 是 Claude Code 默认、最适合编码)。
-// 例:cursor-claude-opus-4-8-xhigh → claude-opus-4-8 + 思考;无后缀 = 不思考。
-// 每个 baseModel 的所有变体都会自动出现在 Cursor 模型列表里。
-//
-// 鉴权:key 透传 —— Cursor 填的 OpenAI API Key 原样转成上游 x-api-key,本程序不存 key。
-//
-// Cursor 配置:Settings → Models → Override OpenAI Base URL = https://你的域名/v1;
-// OpenAI API Key = 你上游中转的 key;模型从列表里选;关掉 Anthropic API Key 栏。
-//
-// 部署:docker compose up -d --build  (HTTPS:cloudflared tunnel --url http://localhost:<PORT>)
-//
-// 单文件、零第三方依赖。go.mod 仅为 Go 构建必需(module 声明)。
+// No third-party dependencies: main.go holds entry/convert/forward, util.go the
+// pure helpers. go.mod exists only for the Go module declaration.
 package main
 
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
 
-func env(k, d string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return d
-}
-
 var (
-	upstreamURL  = strings.TrimRight(env("UPSTREAM_URL", "http://152.53.52.170:3003"), "/") + "/v1/messages"
+	upstreamURL  = strings.TrimRight(env("UPSTREAM_URL", "https://api.anthropic.com"), "/") + "/v1/messages"
 	modelPrefix  = env("MODEL_PREFIX", "cursor-")
 	anthVersion  = env("ANTHROPIC_VERSION", "2023-06-01")
 	port         = env("PORT", "3000")
 	defMaxTokens = 8192
 	debug        = os.Getenv("DEBUG") == "1"
 
-	// baseModels:暴露给 Cursor 的真实模型(去前缀后的名字)。新模型出了就往这加一行。
+	// baseModels: the real models exposed to Cursor (names after the prefix is stripped).
+	// Add a line here when a new model ships.
 	baseModels = []string{"claude-opus-4-8", "claude-opus-4-7"}
-	// effortOrder:思考等级,既定义合法值也定义 /v1/models 里变体的展示顺序。
+	// effortOrder: thinking levels. Defines both the valid values and the display order
+	// of the variants in /v1/models.
 	effortOrder = []string{"low", "medium", "high", "xhigh", "max"}
 
 	httpClient  = &http.Client{Timeout: 10 * time.Minute}
@@ -82,7 +48,7 @@ var (
 	retryDelays = []time.Duration{800 * time.Millisecond, 2 * time.Second}
 )
 
-// effortLevels 由 effortOrder 派生,供 splitEffort 做合法性校验。
+// effortLevels is derived from effortOrder; used by splitEffort for validation.
 var effortLevels = func() map[string]bool {
 	m := map[string]bool{}
 	for _, e := range effortOrder {
@@ -125,7 +91,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	model, _ := body["model"].(string)
 	recover := makeRecover(toolNames)
 
-	// 请求摘要:toolResults>0 = Cursor 把工具结果发回来了(多轮)
+	// Request summary: toolResults>0 means Cursor sent tool results back (multi-turn).
 	nMsgs, nToolRes := 0, 0
 	if msgs, ok := body["messages"].([]any); ok {
 		nMsgs = len(msgs)
@@ -168,15 +134,16 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, toOpenAIResponse(data, model, recover))
 }
 
-// ─────────────────── OpenAI → Anthropic 请求转换 ───────────────────
+// ─────────────────── OpenAI → Anthropic request conversion ───────────────────
 
 func toAnthropic(body map[string]any) (map[string]any, []string) {
 	out := map[string]any{}
 	model, _ := body["model"].(string)
 	realModel, effort := splitEffort(strings.TrimPrefix(model, modelPrefix))
 	out["model"] = realModel
-	// 模型名带 -<effort> 后缀(low/medium/high/xhigh/max)= 开启自适应思考并设思考等级。
-	// 例:cursor-claude-opus-4-8-xhigh → claude-opus-4-8 + thinking:adaptive + effort:xhigh
+	// A -<effort> suffix on the model name (low/medium/high/xhigh/max) turns on adaptive
+	// thinking at that level.
+	// e.g. cursor-claude-opus-4-8-xhigh -> claude-opus-4-8 + thinking:adaptive + effort:xhigh
 	if effort != "" {
 		out["thinking"] = map[string]any{"type": "adaptive"}
 		out["output_config"] = map[string]any{"effort": effort}
@@ -207,7 +174,7 @@ func toAnthropic(body map[string]any) (map[string]any, []string) {
 		}
 	}
 
-	// messages → system + 归一化消息序列(再合并相邻同 role)
+	// messages -> system + normalized message sequence (then merge adjacent same-role)
 	var systemParts []string
 	type rmsg struct {
 		role    string
@@ -257,18 +224,18 @@ func toAnthropic(body map[string]any) (map[string]any, []string) {
 				}
 			}
 			if len(c) == 0 {
-				continue // 空 assistant 消息跳过(避免空 text block 触发 400)
+				continue // skip empty assistant message (an empty text block triggers 400)
 			}
 			seq = append(seq, rmsg{"assistant", c})
 		default: // user
 			c := convertParts(m["content"])
 			if len(c) == 0 {
-				continue // 跳过空 user 消息
+				continue // skip empty user message
 			}
 			seq = append(seq, rmsg{"user", c})
 		}
 	}
-	// 合并相邻同 role
+	// merge adjacent same-role messages
 	var merged []map[string]any
 	for _, m := range seq {
 		if n := len(merged); n > 0 && merged[n-1]["role"] == m.role {
@@ -277,7 +244,7 @@ func toAnthropic(body map[string]any) (map[string]any, []string) {
 			merged = append(merged, map[string]any{"role": m.role, "content": append([]any{}, m.content...)})
 		}
 	}
-	// Anthropic 要求:至少一条消息,且首条必须是 user
+	// Anthropic requires at least one message, and the first must be a user message.
 	if len(merged) == 0 {
 		merged = []map[string]any{{"role": "user", "content": []any{map[string]any{"type": "text", "text": "Continue."}}}}
 	} else if merged[0]["role"] != "user" {
@@ -288,7 +255,7 @@ func toAnthropic(body map[string]any) (map[string]any, []string) {
 		out["system"] = strings.Join(systemParts, "\n\n")
 	}
 
-	// tools(兼容 flat / nested)
+	// tools (accept both flat and nested shapes)
 	var toolNames []string
 	if tools, ok := body["tools"].([]any); ok && len(tools) > 0 {
 		var at []any
@@ -338,7 +305,7 @@ func toAnthropic(body map[string]any) (map[string]any, []string) {
 	return out, toolNames
 }
 
-// ─────────────────── Anthropic → OpenAI 响应转换 ───────────────────
+// ─────────────────── Anthropic → OpenAI response conversion ───────────────────
 
 func toOpenAIResponse(data map[string]any, model string, recover func(string) string) map[string]any {
 	var text strings.Builder
@@ -492,7 +459,7 @@ func streamToOpenAI(w http.ResponseWriter, body io.Reader, model string, recover
 		usageInt(usageStart, "cache_read_input_tokens"), usageInt(usageStart, "cache_creation_input_tokens"))
 }
 
-// ─────────────────── 转发(带重试) ───────────────────
+// ─────────────────── Forwarding (with retry) ───────────────────
 
 func forward(body []byte, key string, stream bool) (*http.Response, int, []byte) {
 	lastStatus, lastBody := 502, []byte(`{"error":{"message":"upstream unreachable"}}`)
@@ -531,6 +498,8 @@ func shouldRetry(status int, body []byte) bool {
 		return true
 	}
 	s := strings.ToLower(string(body))
+	// Retry on upstream "no channel available" / quota errors. The first literal is the
+	// Chinese phrase some relays return in the body — it is matched text, not a translatable comment.
 	for _, kw := range []string{"无可用渠道", "no available channel", "quota", "insufficient"} {
 		if strings.Contains(s, kw) {
 			return true
@@ -545,8 +514,9 @@ func sleep(attempt int) {
 	}
 }
 
-// ─────────────────── 工具名还原 ───────────────────
-// 后端非流式会把工具名改成 Compat<PascalName><hash>。用请求里的真实工具名反查还原。
+// ─────────────────── Tool-name recovery ───────────────────
+// Non-streaming backends rewrite tool names to Compat<PascalName><hash>. Recover the
+// original by matching against the real tool names from the request.
 func makeRecover(names []string) func(string) string {
 	exact := map[string]bool{}
 	type c struct{ norm, orig string }
@@ -555,7 +525,7 @@ func makeRecover(names []string) func(string) string {
 		exact[n] = true
 		cands = append(cands, c{normName(n), n})
 	}
-	// 长前缀优先
+	// longest prefix first
 	for i := 0; i < len(cands); i++ {
 		for j := i + 1; j < len(cands); j++ {
 			if len(cands[j].norm) > len(cands[i].norm) {
@@ -577,20 +547,10 @@ func makeRecover(names []string) func(string) string {
 	}
 }
 
-func normName(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(s) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
+// ─────────────────── Misc ───────────────────
 
-// ─────────────────── 杂项 ───────────────────
-
-// splitEffort 从去前缀后的模型名末尾切出思考等级后缀。
-// "claude-opus-4-8-xhigh" → ("claude-opus-4-8", "xhigh");"claude-opus-4-8" → (原样, "")
+// splitEffort splits a trailing thinking-level suffix off the prefix-stripped model name.
+// "claude-opus-4-8-xhigh" -> ("claude-opus-4-8", "xhigh"); "claude-opus-4-8" -> (unchanged, "")
 func splitEffort(model string) (string, string) {
 	if i := strings.LastIndex(model, "-"); i >= 0 && effortLevels[model[i+1:]] {
 		return model[:i], model[i+1:]
@@ -598,45 +558,11 @@ func splitEffort(model string) (string, string) {
 	return model, ""
 }
 
-func mapStop(r string) string {
-	switch r {
-	case "end_turn", "stop_sequence":
-		return "stop"
-	case "max_tokens":
-		return "length"
-	case "tool_use":
-		return "tool_calls"
-	}
-	return ""
-}
-
-func contentToText(c any) string {
-	switch v := c.(type) {
-	case string:
-		return v
-	case []any:
-		var parts []string
-		for _, pv := range v {
-			if p, ok := pv.(map[string]any); ok {
-				if t, ok := p["text"].(string); ok {
-					parts = append(parts, t)
-				}
-			} else if s, ok := pv.(string); ok {
-				parts = append(parts, s)
-			}
-		}
-		return strings.Join(parts, "\n")
-	case nil:
-		return ""
-	}
-	b, _ := json.Marshal(c)
-	return string(b)
-}
-
-// convertParts 把一条消息的 content 归一化为 Anthropic content blocks。
-// 关键:Cursor 在多轮工具里,会把 tool_use / tool_result(以及 image)直接以
-// 原生 Anthropic block 形式塞进 content 数组(ungate 源码注释:"Cursor sends these"),
-// 必须原样透传,否则工具结果会被丢弃 → 多轮 round-trip 崩。
+// convertParts normalizes a message's content into Anthropic content blocks.
+// Key point: in multi-turn tool use, Cursor puts tool_use / tool_result (and images)
+// directly into the content array as native Anthropic blocks (the ungate source comment
+// reads "Cursor sends these"). They must be passed through as-is, otherwise tool results
+// are dropped and multi-turn round-trips break.
 func convertParts(content any) []any {
 	if s, ok := content.(string); ok {
 		if strings.TrimSpace(s) == "" {
@@ -659,8 +585,8 @@ func convertParts(content any) []any {
 		}
 		switch p["type"] {
 		case "tool_use", "tool_result", "image", "thinking", "redacted_thinking":
-			stripCacheTTL(p)           // 保留 cache_control(缓存断点),删掉需要 beta 头的 ttl
-			blocks = append(blocks, p) // 原生 Anthropic block,透传
+			stripCacheTTL(p)           // keep cache_control (cache breakpoint), drop the ttl that needs a beta header
+			blocks = append(blocks, p) // native Anthropic block, passed through
 		case "text":
 			if t, ok := p["text"].(string); ok && strings.TrimSpace(t) != "" {
 				blocks = append(blocks, map[string]any{"type": "text", "text": t})
@@ -678,81 +604,10 @@ func convertParts(content any) []any {
 	return blocks
 }
 
-// stripCacheTTL 删除 block 上 cache_control 里的 ttl(扩展缓存需 beta 头,否则 400),
-// 但保留 cache_control 本身(标准 ephemeral 缓存断点,GA,无需 beta)。
-func stripCacheTTL(block map[string]any) {
-	if cc, ok := block["cache_control"].(map[string]any); ok {
-		delete(cc, "ttl")
-	}
-}
-
-func dataURIToImage(url string) map[string]any {
-	if !strings.HasPrefix(url, "data:") {
-		return nil
-	}
-	i := strings.Index(url, ";base64,")
-	if i < 0 {
-		return nil
-	}
-	mt := url[5:i]
-	data := url[i+8:]
-	return map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": mt, "data": data}}
-}
-
-func numField(m map[string]any, k string) (int, bool) {
-	if v, ok := m[k]; ok {
-		return numFromAny(v)
-	}
-	return 0, false
-}
-func numFromAny(v any) (int, bool) {
-	if f, ok := v.(float64); ok {
-		return int(f), true
-	}
-	return 0, false
-}
-func usageInt(m map[string]any, k string) int {
-	if m == nil {
-		return 0
-	}
-	n, _ := numFromAny(m[k])
-	return n
-}
-func logUsage(tag string, u any) {
-	if m, ok := u.(map[string]any); ok {
-		log.Printf("%s usage in=%d out=%d cacheRead=%d cacheCreate=%d", tag,
-			usageInt(m, "input_tokens"), usageInt(m, "output_tokens"),
-			usageInt(m, "cache_read_input_tokens"), usageInt(m, "cache_creation_input_tokens"))
-	}
-}
-func truncate(b []byte, n int) string {
-	if len(b) <= n {
-		return string(b)
-	}
-	return string(b[:n]) + "...(" + strconv.Itoa(len(b)) + "B)"
-}
-func mapField(m map[string]any, k string) map[string]any {
-	if v, ok := m[k].(map[string]any); ok {
-		return v
-	}
-	return nil
-}
-func strField(m map[string]any, k string) string { s, _ := m[k].(string); return s }
-func strOr(v any, d string) string {
-	if s, ok := v.(string); ok && s != "" {
-		return s
-	}
-	return d
-}
-func randID() string {
-	b := make([]byte, 12)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-// handleModels 动态展开模型列表:每个 baseModel 产出 "无思考" + 各 effort 档变体,
-// 全部加上 modelPrefix。无需任何配置,加新模型只改 baseModels。
-// 例:claude-opus-4-8 → cursor-claude-opus-4-8, cursor-claude-opus-4-8-low ... -max
+// handleModels expands the model list dynamically: each baseModel yields a "no thinking"
+// variant plus one variant per effort level, all with modelPrefix prepended. No config
+// needed; to add a model, just edit baseModels.
+// e.g. claude-opus-4-8 -> cursor-claude-opus-4-8, cursor-claude-opus-4-8-low ... -max
 func handleModels(w http.ResponseWriter, r *http.Request) {
 	var data []any
 	add := func(id string) {
