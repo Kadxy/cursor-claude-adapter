@@ -68,7 +68,3 @@ All variables have defaults; set them in `.env` / `docker-compose` for productio
 | `ANTHROPIC_VERSION` | `2023-06-01` | `anthropic-version` header. |
 | `PORT` | `3000` | Port the service listens on. |
 | `DEBUG` | `0` | Set to `1` to log request/response summaries. |
-
-## Notes
-
-No third-party dependencies — `main.go` for entry/convert/forward, `util.go` for helpers.
