@@ -4,10 +4,10 @@ services:
     image: cursor-claude-adapter:latest
     container_name: cursor-claude-adapter
     restart: unless-stopped
-    # Bind to loopback only by default; expose publicly via a tunnel (cloudflared).
-    # Override BIND=0.0.0.0 to listen on all interfaces.
+    # Bind to loopback only; expose publicly via reverse proxy or cloudflared.
+    # Change 127.0.0.1 to 0.0.0.0 here if you need to listen on all interfaces.
     ports:
-      - "${BIND:-127.0.0.1}:${PORT:-3000}:3000"
+      - "127.0.0.1:${PORT:-3000}:3000"
     env_file: .env
     environment:
       - PORT=3000

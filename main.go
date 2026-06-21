@@ -19,6 +19,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -28,13 +29,14 @@ import (
 	"time"
 )
 
+const defMaxTokens = 8192
+
 var (
-	upstreamURL  = strings.TrimRight(env("UPSTREAM_URL", "https://api.anthropic.com"), "/") + "/v1/messages"
-	modelPrefix  = env("MODEL_PREFIX", "cursor-")
-	anthVersion  = env("ANTHROPIC_VERSION", "2023-06-01")
-	port         = env("PORT", "3000")
-	defMaxTokens = 8192
-	debug        = os.Getenv("DEBUG") == "1"
+	upstreamURL = strings.TrimRight(env("UPSTREAM_URL", "https://api.anthropic.com"), "/") + "/v1/messages"
+	modelPrefix = env("MODEL_PREFIX", "cursor-")
+	anthVersion = env("ANTHROPIC_VERSION", "2023-06-01")
+	port        = env("PORT", "3000")
+	debug       = os.Getenv("DEBUG") == "1"
 
 	// baseModels: the real models exposed to Cursor (names after the prefix is stripped).
 	// Add a line here when a new model ships.
@@ -66,7 +68,8 @@ func main() {
 		w.Write([]byte("cursor-claude-adapter (go, messages) ok"))
 	})
 	log.Printf("cursor-claude-adapter (go, /v1/messages) on :%s -> %s", port, upstreamURL)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	srv := &http.Server{Addr: ":" + port, ReadHeaderTimeout: 10 * time.Second}
+	log.Fatal(srv.ListenAndServe())
 }
 
 func handleChat(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +92,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	anth, toolNames := toAnthropic(body)
 	stream, _ := anth["stream"].(bool)
 	model, _ := body["model"].(string)
-	recover := makeRecover(toolNames)
+	recoverName := makeRecover(toolNames)
 
 	// Request summary: toolResults>0 means Cursor sent tool results back (multi-turn).
 	nMsgs, nToolRes := 0, 0
@@ -108,7 +111,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 		log.Printf("DBG  anthReq=%s", truncate(out, 2000))
 	}
 
-	resp, status, errBody := forward(out, key, stream)
+	resp, status, errBody := forward(r.Context(), out, key, stream)
 	if resp == nil {
 		log.Printf("ERR  upstream status=%d body=%s", status, truncate(errBody, 400))
 		w.Header().Set("Content-Type", "application/json")
@@ -122,7 +125,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(200)
-		streamToOpenAI(w, resp.Body, model, recover)
+		streamToOpenAI(w, resp.Body, model, recoverName)
 		return
 	}
 	var data map[string]any
@@ -131,7 +134,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logUsage("RESP json", data["usage"])
-	writeJSON(w, 200, toOpenAIResponse(data, model, recover))
+	writeJSON(w, 200, toOpenAIResponse(data, model, recoverName))
 }
 
 // ─────────────────── OpenAI → Anthropic request conversion ───────────────────
@@ -307,7 +310,7 @@ func toAnthropic(body map[string]any) (map[string]any, []string) {
 
 // ─────────────────── Anthropic → OpenAI response conversion ───────────────────
 
-func toOpenAIResponse(data map[string]any, model string, recover func(string) string) map[string]any {
+func toOpenAIResponse(data map[string]any, model string, recoverName func(string) string) map[string]any {
 	var text strings.Builder
 	var toolCalls []any
 	if content, ok := data["content"].([]any); ok {
@@ -326,7 +329,7 @@ func toOpenAIResponse(data map[string]any, model string, recover func(string) st
 				args, _ := json.Marshal(b["input"])
 				toolCalls = append(toolCalls, map[string]any{
 					"id": b["id"], "type": "function",
-					"function": map[string]any{"name": recover(name), "arguments": string(args)},
+					"function": map[string]any{"name": recoverName(name), "arguments": string(args)},
 				})
 			}
 		}
@@ -359,7 +362,7 @@ func toOpenAIResponse(data map[string]any, model string, recover func(string) st
 	return resp
 }
 
-func streamToOpenAI(w http.ResponseWriter, body io.Reader, model string, recover func(string) string) {
+func streamToOpenAI(w http.ResponseWriter, body io.Reader, model string, recoverName func(string) string) {
 	flusher, _ := w.(http.Flusher)
 	id := "chatcmpl-" + randID()
 	created := time.Now().Unix()
@@ -406,7 +409,7 @@ func streamToOpenAI(w http.ResponseWriter, body io.Reader, model string, recover
 				name, _ := cb["name"].(string)
 				emit(map[string]any{"tool_calls": []any{map[string]any{
 					"index": toolIndex, "id": cb["id"], "type": "function",
-					"function": map[string]any{"name": recover(name), "arguments": ""},
+					"function": map[string]any{"name": recoverName(name), "arguments": ""},
 				}}}, nil)
 			}
 		case "content_block_delta":
@@ -461,11 +464,11 @@ func streamToOpenAI(w http.ResponseWriter, body io.Reader, model string, recover
 
 // ─────────────────── Forwarding (with retry) ───────────────────
 
-func forward(body []byte, key string, stream bool) (*http.Response, int, []byte) {
+func forward(ctx context.Context, body []byte, key string, stream bool) (*http.Response, int, []byte) {
 	lastStatus, lastBody := 502, []byte(`{"error":{"message":"upstream unreachable"}}`)
 	attempts := 1 + len(retryDelays)
 	for attempt := 0; attempt < attempts; attempt++ {
-		req, _ := http.NewRequest(http.MethodPost, upstreamURL, bytes.NewReader(body))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-api-key", key)
 		req.Header.Set("anthropic-version", anthVersion)
@@ -474,7 +477,10 @@ func forward(body []byte, key string, stream bool) (*http.Response, int, []byte)
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			lastStatus, lastBody = 502, []byte(err.Error())
+			lastStatus, lastBody = 502, errJSON(err.Error())
+			if ctx.Err() != nil {
+				break // client gone, don't retry
+			}
 			sleep(attempt)
 			continue
 		}
@@ -638,4 +644,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": msg}})
+}
+
+// errJSON wraps a raw error string as an OpenAI-style JSON error body, so the bytes we
+// send on a transport failure match the application/json content-type we set.
+func errJSON(msg string) []byte {
+	b, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg}})
+	return b
 }
