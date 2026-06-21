@@ -12,14 +12,16 @@
 // Config is via env vars (all have defaults); see README.md for the full setup,
 // model list, thinking levels, and deployment notes.
 //
-// No third-party dependencies: main.go holds entry/convert/forward, util.go the
-// pure helpers. go.mod exists only for the Go module declaration.
+// No third-party dependencies. Source is split by responsibility:
+//
+//	main.go     entry, HTTP handlers, config
+//	convert.go  OpenAI -> Anthropic request conversion + tool-name recovery
+//	stream.go   Anthropic -> OpenAI response conversion (stream + non-stream)
+//	forward.go  upstream forwarding with retry/backoff
+//	util.go     pure stateless helpers
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -29,7 +31,10 @@ import (
 	"time"
 )
 
-const defMaxTokens = 8192
+// maxRequestBody caps an incoming request body (Cursor sends OpenAI Chat Completions
+// JSON). It bounds memory per request so a malformed or hostile client can't force an
+// unbounded read; 32 MiB leaves ample room for large multi-turn + image payloads.
+const maxRequestBody = 32 << 20
 
 var (
 	upstreamURL = strings.TrimRight(env("UPSTREAM_URL", "https://api.anthropic.com"), "/") + "/v1/messages"
@@ -37,27 +42,7 @@ var (
 	anthVersion = env("ANTHROPIC_VERSION", "2023-06-01")
 	port        = env("PORT", "3000")
 	debug       = os.Getenv("DEBUG") == "1"
-
-	// baseModels: the real models exposed to Cursor (names after the prefix is stripped).
-	// Add a line here when a new model ships.
-	baseModels = []string{"claude-opus-4-8", "claude-opus-4-7"}
-	// effortOrder: thinking levels. Defines both the valid values and the display order
-	// of the variants in /v1/models.
-	effortOrder = []string{"low", "medium", "high", "xhigh", "max"}
-
-	httpClient  = &http.Client{Timeout: 10 * time.Minute}
-	retryStatus = map[int]bool{429: true, 500: true, 502: true, 503: true, 504: true, 524: true}
-	retryDelays = []time.Duration{800 * time.Millisecond, 2 * time.Second}
 )
-
-// effortLevels is derived from effortOrder; used by splitEffort for validation.
-var effortLevels = func() map[string]bool {
-	m := map[string]bool{}
-	for _, e := range effortOrder {
-		m[e] = true
-	}
-	return m
-}()
 
 func main() {
 	http.HandleFunc("/v1/chat/completions", handleChat)
@@ -78,8 +63,12 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := bearer(r)
-	raw, err := io.ReadAll(r.Body)
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
 	if err != nil {
+		if _, ok := err.(*http.MaxBytesError); ok {
+			writeErr(w, 413, "request body too large")
+			return
+		}
 		writeErr(w, 400, "read body failed")
 		return
 	}
@@ -137,479 +126,6 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, toOpenAIResponse(data, model, recoverName))
 }
 
-// ─────────────────── OpenAI → Anthropic request conversion ───────────────────
-
-func toAnthropic(body map[string]any) (map[string]any, []string) {
-	out := map[string]any{}
-	model, _ := body["model"].(string)
-	realModel, effort := splitEffort(strings.TrimPrefix(model, modelPrefix))
-	out["model"] = realModel
-	// A -<effort> suffix on the model name (low/medium/high/xhigh/max) turns on adaptive
-	// thinking at that level.
-	// e.g. cursor-claude-opus-4-8-xhigh -> claude-opus-4-8 + thinking:adaptive + effort:xhigh
-	if effort != "" {
-		out["thinking"] = map[string]any{"type": "adaptive"}
-		out["output_config"] = map[string]any{"effort": effort}
-	}
-
-	mt := defMaxTokens
-	if v, ok := numField(body, "max_tokens"); ok {
-		mt = v
-	} else if v, ok := numField(body, "max_output_tokens"); ok {
-		mt = v
-	}
-	out["max_tokens"] = mt
-	if s, ok := body["stream"].(bool); ok {
-		out["stream"] = s
-	}
-	if v, ok := body["temperature"]; ok {
-		out["temperature"] = v
-	}
-	if v, ok := body["top_p"]; ok {
-		out["top_p"] = v
-	}
-	if v, ok := body["stop"]; ok {
-		switch s := v.(type) {
-		case string:
-			out["stop_sequences"] = []any{s}
-		case []any:
-			out["stop_sequences"] = s
-		}
-	}
-
-	// messages -> system + normalized message sequence (then merge adjacent same-role)
-	var systemParts []string
-	type rmsg struct {
-		role    string
-		content []any
-	}
-	var seq []rmsg
-	msgs, _ := body["messages"].([]any)
-	for _, mm := range msgs {
-		m, ok := mm.(map[string]any)
-		if !ok {
-			continue
-		}
-		role, _ := m["role"].(string)
-		switch role {
-		case "system", "developer":
-			systemParts = append(systemParts, contentToText(m["content"]))
-		case "tool":
-			seq = append(seq, rmsg{"user", []any{map[string]any{
-				"type": "tool_result", "tool_use_id": strField(m, "tool_call_id"), "content": contentToText(m["content"]),
-			}}})
-		case "assistant":
-			c := convertParts(m["content"])
-			if tcs, ok := m["tool_calls"].([]any); ok {
-				for _, tcv := range tcs {
-					tc, ok := tcv.(map[string]any)
-					if !ok {
-						continue
-					}
-					fn := mapField(tc, "function")
-					if fn == nil {
-						fn = tc
-					}
-					name, _ := fn["name"].(string)
-					if name == "" {
-						continue
-					}
-					var input any = map[string]any{}
-					if a, ok := fn["arguments"].(string); ok && a != "" {
-						var parsed any
-						if json.Unmarshal([]byte(a), &parsed) == nil {
-							input = parsed
-						}
-					} else if a, ok := fn["arguments"]; ok && a != nil {
-						input = a
-					}
-					c = append(c, map[string]any{"type": "tool_use", "id": tc["id"], "name": name, "input": input})
-				}
-			}
-			if len(c) == 0 {
-				continue // skip empty assistant message (an empty text block triggers 400)
-			}
-			seq = append(seq, rmsg{"assistant", c})
-		default: // user
-			c := convertParts(m["content"])
-			if len(c) == 0 {
-				continue // skip empty user message
-			}
-			seq = append(seq, rmsg{"user", c})
-		}
-	}
-	// merge adjacent same-role messages
-	var merged []map[string]any
-	for _, m := range seq {
-		if n := len(merged); n > 0 && merged[n-1]["role"] == m.role {
-			merged[n-1]["content"] = append(merged[n-1]["content"].([]any), m.content...)
-		} else {
-			merged = append(merged, map[string]any{"role": m.role, "content": append([]any{}, m.content...)})
-		}
-	}
-	// Anthropic requires at least one message, and the first must be a user message.
-	if len(merged) == 0 {
-		merged = []map[string]any{{"role": "user", "content": []any{map[string]any{"type": "text", "text": "Continue."}}}}
-	} else if merged[0]["role"] != "user" {
-		merged = append([]map[string]any{{"role": "user", "content": []any{map[string]any{"type": "text", "text": "Continue."}}}}, merged...)
-	}
-	out["messages"] = merged
-	if len(systemParts) > 0 {
-		out["system"] = strings.Join(systemParts, "\n\n")
-	}
-
-	// tools (accept both flat and nested shapes)
-	var toolNames []string
-	if tools, ok := body["tools"].([]any); ok && len(tools) > 0 {
-		var at []any
-		for _, tv := range tools {
-			t, ok := tv.(map[string]any)
-			if !ok {
-				continue
-			}
-			fn := mapField(t, "function")
-			if fn == nil {
-				fn = t
-			}
-			name, _ := fn["name"].(string)
-			if name == "" {
-				continue
-			}
-			schema := fn["parameters"]
-			if schema == nil {
-				schema = fn["input_schema"]
-			}
-			if schema == nil {
-				schema = map[string]any{"type": "object", "properties": map[string]any{}}
-			}
-			desc, _ := fn["description"].(string)
-			at = append(at, map[string]any{"name": name, "description": desc, "input_schema": schema})
-			toolNames = append(toolNames, name)
-		}
-		if len(at) > 0 {
-			out["tools"] = at
-		}
-	}
-	// tool_choice
-	switch tc := body["tool_choice"].(type) {
-	case string:
-		if tc == "required" {
-			out["tool_choice"] = map[string]any{"type": "any"}
-		} else if tc == "auto" {
-			out["tool_choice"] = map[string]any{"type": "auto"}
-		}
-	case map[string]any:
-		if fn := mapField(tc, "function"); fn != nil {
-			if n, ok := fn["name"].(string); ok {
-				out["tool_choice"] = map[string]any{"type": "tool", "name": n}
-			}
-		}
-	}
-	return out, toolNames
-}
-
-// ─────────────────── Anthropic → OpenAI response conversion ───────────────────
-
-func toOpenAIResponse(data map[string]any, model string, recoverName func(string) string) map[string]any {
-	var text strings.Builder
-	var toolCalls []any
-	if content, ok := data["content"].([]any); ok {
-		for _, bv := range content {
-			b, ok := bv.(map[string]any)
-			if !ok {
-				continue
-			}
-			switch b["type"] {
-			case "text":
-				if t, ok := b["text"].(string); ok {
-					text.WriteString(t)
-				}
-			case "tool_use":
-				name, _ := b["name"].(string)
-				args, _ := json.Marshal(b["input"])
-				toolCalls = append(toolCalls, map[string]any{
-					"id": b["id"], "type": "function",
-					"function": map[string]any{"name": recoverName(name), "arguments": string(args)},
-				})
-			}
-		}
-	}
-	msg := map[string]any{"role": "assistant"}
-	if text.Len() > 0 {
-		msg["content"] = text.String()
-	} else {
-		msg["content"] = nil
-	}
-	if len(toolCalls) > 0 {
-		msg["tool_calls"] = toolCalls
-	}
-	finish := "stop"
-	if sr, ok := data["stop_reason"].(string); ok {
-		if m := mapStop(sr); m != "" {
-			finish = m
-		}
-	}
-	resp := map[string]any{
-		"id": strOr(data["id"], "chatcmpl-"+randID()), "object": "chat.completion",
-		"created": time.Now().Unix(), "model": model,
-		"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish}},
-	}
-	if u, ok := data["usage"].(map[string]any); ok {
-		in, _ := numFromAny(u["input_tokens"])
-		o, _ := numFromAny(u["output_tokens"])
-		resp["usage"] = map[string]any{"prompt_tokens": in, "completion_tokens": o, "total_tokens": in + o}
-	}
-	return resp
-}
-
-func streamToOpenAI(w http.ResponseWriter, body io.Reader, model string, recoverName func(string) string) {
-	flusher, _ := w.(http.Flusher)
-	id := "chatcmpl-" + randID()
-	created := time.Now().Unix()
-	emit := func(delta map[string]any, finish any) {
-		chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
-		b, _ := json.Marshal(chunk)
-		w.Write([]byte("data: " + string(b) + "\n\n"))
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
-	emit(map[string]any{"role": "assistant", "content": ""}, nil)
-
-	toolIndex := -1
-	blockToTool := map[int]int{}
-	var finish any = nil
-	var usageStart, usageDelta map[string]any
-	textLen := 0
-
-	sc := bufio.NewScanner(body)
-	sc.Buffer(make([]byte, 1024*1024), 16*1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		ds := strings.TrimSpace(line[5:])
-		if ds == "" {
-			continue
-		}
-		var d map[string]any
-		if json.Unmarshal([]byte(ds), &d) != nil {
-			continue
-		}
-		switch d["type"] {
-		case "content_block_start":
-			cb, _ := d["content_block"].(map[string]any)
-			if cb != nil && cb["type"] == "tool_use" {
-				toolIndex++
-				if idx, ok := numFromAny(d["index"]); ok {
-					blockToTool[idx] = toolIndex
-				}
-				name, _ := cb["name"].(string)
-				emit(map[string]any{"tool_calls": []any{map[string]any{
-					"index": toolIndex, "id": cb["id"], "type": "function",
-					"function": map[string]any{"name": recoverName(name), "arguments": ""},
-				}}}, nil)
-			}
-		case "content_block_delta":
-			delta, _ := d["delta"].(map[string]any)
-			if delta == nil {
-				continue
-			}
-			switch delta["type"] {
-			case "text_delta":
-				if t, ok := delta["text"].(string); ok {
-					textLen += len(t)
-					emit(map[string]any{"content": t}, nil)
-				}
-			case "input_json_delta":
-				idx, _ := numFromAny(d["index"])
-				pj, _ := delta["partial_json"].(string)
-				emit(map[string]any{"tool_calls": []any{map[string]any{
-					"index": blockToTool[idx], "function": map[string]any{"arguments": pj},
-				}}}, nil)
-			}
-		case "message_start":
-			if msg, ok := d["message"].(map[string]any); ok {
-				usageStart, _ = msg["usage"].(map[string]any)
-			}
-		case "message_delta":
-			if u, ok := d["usage"].(map[string]any); ok {
-				usageDelta = u
-			}
-			if delta, ok := d["delta"].(map[string]any); ok {
-				if sr, ok := delta["stop_reason"].(string); ok {
-					if m := mapStop(sr); m != "" {
-						finish = m
-					}
-				}
-			}
-		case "message_stop":
-			if finish == nil {
-				finish = "stop"
-			}
-			emit(map[string]any{}, finish)
-		}
-	}
-	w.Write([]byte("data: [DONE]\n\n"))
-	if flusher != nil {
-		flusher.Flush()
-	}
-	log.Printf("RESP stream text=%dchars toolCalls=%d finish=%v | usage in=%d out=%d cacheRead=%d cacheCreate=%d",
-		textLen, toolIndex+1, finish,
-		usageInt(usageStart, "input_tokens"), usageInt(usageDelta, "output_tokens"),
-		usageInt(usageStart, "cache_read_input_tokens"), usageInt(usageStart, "cache_creation_input_tokens"))
-}
-
-// ─────────────────── Forwarding (with retry) ───────────────────
-
-func forward(ctx context.Context, body []byte, key string, stream bool) (*http.Response, int, []byte) {
-	lastStatus, lastBody := 502, []byte(`{"error":{"message":"upstream unreachable"}}`)
-	attempts := 1 + len(retryDelays)
-	for attempt := 0; attempt < attempts; attempt++ {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("x-api-key", key)
-		req.Header.Set("anthropic-version", anthVersion)
-		if stream {
-			req.Header.Set("Accept", "text/event-stream")
-		}
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			lastStatus, lastBody = 502, errJSON(err.Error())
-			if ctx.Err() != nil {
-				break // client gone, don't retry
-			}
-			sleep(attempt)
-			continue
-		}
-		if resp.StatusCode < 400 {
-			return resp, 200, nil
-		}
-		eb, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		lastStatus, lastBody = resp.StatusCode, eb
-		if !shouldRetry(resp.StatusCode, eb) {
-			break
-		}
-		log.Printf("upstream %d, retry %d/%d", resp.StatusCode, attempt+1, attempts)
-		sleep(attempt)
-	}
-	return nil, lastStatus, lastBody
-}
-
-func shouldRetry(status int, body []byte) bool {
-	if retryStatus[status] {
-		return true
-	}
-	s := strings.ToLower(string(body))
-	// Retry on upstream "no channel available" / quota errors. The first literal is the
-	// Chinese phrase some relays return in the body — it is matched text, not a translatable comment.
-	for _, kw := range []string{"无可用渠道", "no available channel", "quota", "insufficient"} {
-		if strings.Contains(s, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-func sleep(attempt int) {
-	if attempt < len(retryDelays) {
-		time.Sleep(retryDelays[attempt])
-	}
-}
-
-// ─────────────────── Tool-name recovery ───────────────────
-// Non-streaming backends rewrite tool names to Compat<PascalName><hash>. Recover the
-// original by matching against the real tool names from the request.
-func makeRecover(names []string) func(string) string {
-	exact := map[string]bool{}
-	type c struct{ norm, orig string }
-	var cands []c
-	for _, n := range names {
-		exact[n] = true
-		cands = append(cands, c{normName(n), n})
-	}
-	// longest prefix first
-	for i := 0; i < len(cands); i++ {
-		for j := i + 1; j < len(cands); j++ {
-			if len(cands[j].norm) > len(cands[i].norm) {
-				cands[i], cands[j] = cands[j], cands[i]
-			}
-		}
-	}
-	return func(returned string) string {
-		if returned == "" || exact[returned] {
-			return returned
-		}
-		ns := normName(strings.TrimPrefix(returned, "Compat"))
-		for _, cd := range cands {
-			if cd.norm != "" && strings.HasPrefix(ns, cd.norm) {
-				return cd.orig
-			}
-		}
-		return returned
-	}
-}
-
-// ─────────────────── Misc ───────────────────
-
-// splitEffort splits a trailing thinking-level suffix off the prefix-stripped model name.
-// "claude-opus-4-8-xhigh" -> ("claude-opus-4-8", "xhigh"); "claude-opus-4-8" -> (unchanged, "")
-func splitEffort(model string) (string, string) {
-	if i := strings.LastIndex(model, "-"); i >= 0 && effortLevels[model[i+1:]] {
-		return model[:i], model[i+1:]
-	}
-	return model, ""
-}
-
-// convertParts normalizes a message's content into Anthropic content blocks.
-// Key point: in multi-turn tool use, Cursor puts tool_use / tool_result (and images)
-// directly into the content array as native Anthropic blocks (the ungate source comment
-// reads "Cursor sends these"). They must be passed through as-is, otherwise tool results
-// are dropped and multi-turn round-trips break.
-func convertParts(content any) []any {
-	if s, ok := content.(string); ok {
-		if strings.TrimSpace(s) == "" {
-			return nil
-		}
-		return []any{map[string]any{"type": "text", "text": s}}
-	}
-	arr, ok := content.([]any)
-	if !ok {
-		return nil
-	}
-	var blocks []any
-	for _, pv := range arr {
-		p, ok := pv.(map[string]any)
-		if !ok {
-			if s, ok := pv.(string); ok && strings.TrimSpace(s) != "" {
-				blocks = append(blocks, map[string]any{"type": "text", "text": s})
-			}
-			continue
-		}
-		switch p["type"] {
-		case "tool_use", "tool_result", "image", "thinking", "redacted_thinking":
-			stripCacheTTL(p)           // keep cache_control (cache breakpoint), drop the ttl that needs a beta header
-			blocks = append(blocks, p) // native Anthropic block, passed through
-		case "text":
-			if t, ok := p["text"].(string); ok && strings.TrimSpace(t) != "" {
-				blocks = append(blocks, map[string]any{"type": "text", "text": t})
-			}
-		case "image_url":
-			if iu, ok := p["image_url"].(map[string]any); ok {
-				if url, ok := iu["url"].(string); ok {
-					if blk := dataURIToImage(url); blk != nil {
-						blocks = append(blocks, blk)
-					}
-				}
-			}
-		}
-	}
-	return blocks
-}
-
 // handleModels expands the model list dynamically: each baseModel yields a "no thinking"
 // variant plus one variant per effort level, all with modelPrefix prepended. No config
 // needed; to add a model, just edit baseModels.
@@ -627,6 +143,7 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
 }
+
 func bearer(r *http.Request) string {
 	a := r.Header.Get("Authorization")
 	if len(a) > 7 && strings.EqualFold(a[:7], "Bearer ") {
@@ -637,11 +154,13 @@ func bearer(r *http.Request) string {
 	}
 	return strings.TrimSpace(a)
 }
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
 }
+
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": msg}})
 }

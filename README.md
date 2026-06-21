@@ -13,29 +13,32 @@ Cursor (OpenAI Chat Completions)  --[Override OpenAI Base URL]-->  this adapter
 ## Quick start
 
 ```bash
-cp .env.example .env   # edit if needed
-docker compose up -d --build
+docker run -d --name cursor-claude-adapter \
+  -p 127.0.0.1:3000:3000 \
+  -e UPSTREAM_URL=https://api.anthropic.com \
+  ghcr.io/kadxy/cursor-claude-adapter:latest
 ```
 
-Expose it over HTTPS (Cursor needs a public URL):
+Or from a clone:
 
 ```bash
-cloudflared tunnel --url http://localhost:3000
+git clone https://github.com/Kadxy/cursor-claude-adapter.git
+cd cursor-claude-adapter
+cp .env.example .env   # edit if needed
+docker compose up -d --build
 ```
 
 ## Cursor setup
 
 Settings -> Models:
 
-- **Override OpenAI Base URL**: `https://your-domain/v1`
+- **Override OpenAI Base URL**: `https://<your-adapter-host>/v1`
 - **OpenAI API Key**: the key for your upstream relay (passed through as-is)
-- Pick a model from the list
-- Turn off the Anthropic API Key field
+- Add a model by typing its name (e.g. `cursor-claude-opus-4-8-xhigh`)
 
 ## Models
 
-`/v1/models` is generated dynamically: every base model is exposed with a "no thinking"
-variant plus one variant per thinking level. To add a model, add one line to `baseModels`
+`/v1/models` is generated dynamically. To add a model, add one line to `baseModels`
 in `main.go` — no config needed.
 
 ### Thinking levels
@@ -68,5 +71,4 @@ All variables have defaults; set them in `.env` / `docker-compose` for productio
 
 ## Notes
 
-No third-party dependencies (`main.go` for entry/convert/forward, `util.go` for pure
-helpers). `go.mod` only exists because Go needs it for the module declaration.
+No third-party dependencies — `main.go` for entry/convert/forward, `util.go` for helpers.
