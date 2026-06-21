@@ -22,12 +22,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -45,16 +48,37 @@ var (
 )
 
 func main() {
-	http.HandleFunc("/v1/chat/completions", handleChat)
-	http.HandleFunc("/v1/responses", handleChat)
-	http.HandleFunc("/v1/models", handleModels)
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]any{"status": "ok"}) })
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", handleChat)
+	mux.HandleFunc("/v1/responses", handleChat)
+	mux.HandleFunc("/v1/models", handleModels)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]any{"status": "ok"}) })
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("cursor-claude-adapter (go, messages) ok"))
 	})
 	log.Printf("cursor-claude-adapter (go, /v1/messages) on :%s -> %s", port, upstreamURL)
-	srv := &http.Server{Addr: ":" + port, ReadHeaderTimeout: 10 * time.Second}
-	log.Fatal(srv.ListenAndServe())
+	srv := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+
+	// Graceful shutdown: on SIGINT/SIGTERM (e.g. `docker stop`), stop accepting new
+	// connections and let in-flight requests (including long streams) drain before exit.
+	idleClosed := make(chan struct{})
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		log.Printf("shutting down, draining in-flight requests...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+		}
+		close(idleClosed)
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
+	<-idleClosed
 }
 
 func handleChat(w http.ResponseWriter, r *http.Request) {
