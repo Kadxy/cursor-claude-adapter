@@ -1,2 +1,6 @@
+# env
 .env
-dump/
+!.env.example
+
+# build
+cursor-claude-adapter

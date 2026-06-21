@@ -18,22 +18,24 @@
 //
 // 环境变量(均有默认值,生产配在 .env / docker-compose):
 //
-//	UPSTREAM_URL       上游 Anthropic /v1/messages 全路径(默认 http://152.53.52.170:3003/v1/messages)
+//	UPSTREAM_URL       上游服务地址(只配 host,默认 http://152.53.52.170:3003);/v1/messages 路径在代码里固定拼接,不要带
 //	MODEL_PREFIX       Cursor 模型名前缀,转发前去掉(默认 cursor-;cursor-claude-opus-4-8 → claude-opus-4-8)
-//	MODELS             /v1/models 暴露给 Cursor 的模型名,逗号分隔(默认 cursor-claude-opus-4-8)
 //	ANTHROPIC_VERSION  anthropic-version 头(默认 2023-06-01)
 //	PORT               监听端口(默认 3000;docker 里容器固定 3000,对外端口看 compose)
 //	DEBUG              =1 打印进出报文摘要
 //
+// /v1/models 暴露给 Cursor 的模型列表是代码里动态展开的(baseModels × 思考档),无需配置;
+// 加新模型只改 main.go 的 baseModels。
+//
 // 思考等级:模型名加后缀 -low/-medium/-high/-xhigh/-max,即注入 thinking:adaptive +
 // output_config.effort 开启对应等级的思考(xhigh 是 Claude Code 默认、最适合编码)。
 // 例:cursor-claude-opus-4-8-xhigh → claude-opus-4-8 + 思考;无后缀 = 不思考。
-// 把这些变体名都填进 MODELS,Cursor 模型列表里就能选。
+// 每个 baseModel 的所有变体都会自动出现在 Cursor 模型列表里。
 //
 // 鉴权:key 透传 —— Cursor 填的 OpenAI API Key 原样转成上游 x-api-key,本程序不存 key。
 //
 // Cursor 配置:Settings → Models → Override OpenAI Base URL = https://你的域名/v1;
-// OpenAI API Key = 你上游中转的 key;自定义模型名用 MODELS 里的;关掉 Anthropic API Key 栏。
+// OpenAI API Key = 你上游中转的 key;模型从列表里选;关掉 Anthropic API Key 栏。
 //
 // 部署:docker compose up -d --build  (HTTPS:cloudflared tunnel --url http://localhost:<PORT>)
 //
@@ -63,19 +65,31 @@ func env(k, d string) string {
 }
 
 var (
-	upstreamURL  = env("UPSTREAM_URL", "http://152.53.52.170:3003/v1/messages")
+	upstreamURL  = strings.TrimRight(env("UPSTREAM_URL", "http://152.53.52.170:3003"), "/") + "/v1/messages"
 	modelPrefix  = env("MODEL_PREFIX", "cursor-")
 	anthVersion  = env("ANTHROPIC_VERSION", "2023-06-01")
 	port         = env("PORT", "3000")
-	models       = strings.Split(env("MODELS", "cursor-claude-opus-4-8"), ",")
 	defMaxTokens = 8192
 	debug        = os.Getenv("DEBUG") == "1"
 
-	httpClient   = &http.Client{Timeout: 10 * time.Minute}
-	retryStatus  = map[int]bool{429: true, 500: true, 502: true, 503: true, 504: true, 524: true}
-	retryDelays  = []time.Duration{800 * time.Millisecond, 2 * time.Second}
-	effortLevels = map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true}
+	// baseModels:暴露给 Cursor 的真实模型(去前缀后的名字)。新模型出了就往这加一行。
+	baseModels = []string{"claude-opus-4-8", "claude-opus-4-7"}
+	// effortOrder:思考等级,既定义合法值也定义 /v1/models 里变体的展示顺序。
+	effortOrder = []string{"low", "medium", "high", "xhigh", "max"}
+
+	httpClient  = &http.Client{Timeout: 10 * time.Minute}
+	retryStatus = map[int]bool{429: true, 500: true, 502: true, 503: true, 504: true, 524: true}
+	retryDelays = []time.Duration{800 * time.Millisecond, 2 * time.Second}
 )
+
+// effortLevels 由 effortOrder 派生,供 splitEffort 做合法性校验。
+var effortLevels = func() map[string]bool {
+	m := map[string]bool{}
+	for _, e := range effortOrder {
+		m[e] = true
+	}
+	return m
+}()
 
 func main() {
 	http.HandleFunc("/v1/chat/completions", handleChat)
@@ -736,10 +750,19 @@ func randID() string {
 	return hex.EncodeToString(b)
 }
 
+// handleModels 动态展开模型列表:每个 baseModel 产出 "无思考" + 各 effort 档变体,
+// 全部加上 modelPrefix。无需任何配置,加新模型只改 baseModels。
+// 例:claude-opus-4-8 → cursor-claude-opus-4-8, cursor-claude-opus-4-8-low ... -max
 func handleModels(w http.ResponseWriter, r *http.Request) {
 	var data []any
-	for _, m := range models {
-		data = append(data, map[string]any{"id": strings.TrimSpace(m), "object": "model", "created": 0, "owned_by": "adapter"})
+	add := func(id string) {
+		data = append(data, map[string]any{"id": id, "object": "model", "created": 0, "owned_by": "adapter"})
+	}
+	for _, base := range baseModels {
+		add(modelPrefix + base)
+		for _, eff := range effortOrder {
+			add(modelPrefix + base + "-" + eff)
+		}
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
 }

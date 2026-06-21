@@ -4,9 +4,10 @@ services:
     image: cursor-claude-adapter:latest
     container_name: cursor-claude-adapter
     restart: unless-stopped
-    # 对外端口由 .env 的 PORT 决定;容器内固定 3000
+    # Bind to loopback only by default; expose publicly via a tunnel (cloudflared).
+    # Override BIND=0.0.0.0 to listen on all interfaces.
     ports:
-      - "${PORT:-3000}:3000"
+      - "${BIND:-127.0.0.1}:${PORT:-3000}:3000"
     env_file: .env
     environment:
       - PORT=3000
