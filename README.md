@@ -1,6 +1,6 @@
 # cursor-claude-adapter
 
-Use your own Anthropic-format relay as a model provider in Cursor (BYOK).
+Use any third-party Claude (Anthropic) API in Cursor.
 
 ## How it works
 
